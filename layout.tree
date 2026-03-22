@@ -1,0 +1,19 @@
+ai-agent/
+├── bin/
+│   └── agent.py
+├── prompts/
+│   └── example_job/
+│       ├── context.md
+│       ├── goals.md
+│       ├── constraints.md
+│       └── tasks.md
+├── inbox/
+├── outbox/
+├── archive/
+├── failed/
+├── runs/
+├── config.yaml
+└── systemd/
+    ├── ai-agent.path
+    └── ai-agent.service
+

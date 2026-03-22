@@ -1,0 +1,20 @@
+[Unit]
+Description=Piper Automation Server
+Documentation=file://%h/Code/Piper/docs/thoughts.md
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/Code/Piper
+ExecStart=/usr/bin/python3 %h/Code/Piper/bin/piper_server.py
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+# Security sandboxing
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

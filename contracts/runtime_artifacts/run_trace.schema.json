@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://krax/contracts/runtime_artifacts/run_trace.schema.json",
+  "title": "RunTrace",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["job_id", "events", "started_at", "updated_at"],
+  "properties": {
+    "job_id": { "type": "string", "minLength": 1 },
+    "started_at": { "type": "string", "format": "date-time" },
+    "updated_at": { "type": "string", "format": "date-time" },
+    "events": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["at", "stage", "event", "detail"],
+        "properties": {
+          "at": { "type": "string", "format": "date-time" },
+          "stage": {
+            "type": "string",
+            "enum": ["auralis", "krax", "mason", "flash", "vera", "gatekeeper"]
+          },
+          "event": { "type": "string", "minLength": 1 },
+          "detail": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

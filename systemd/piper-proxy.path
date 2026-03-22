@@ -1,0 +1,9 @@
+[Unit]
+Description=Monitor inbox for new Piper jobs
+
+[Path]
+DirectoryNotEmpty=%h/Code/Piper/inbox
+Unit=piper-proxy.service
+
+[Install]
+WantedBy=paths.target

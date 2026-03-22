@@ -1,0 +1,39 @@
+{
+    "manifest_version": 3,
+    "name": "Krax Grok Automation Client",
+    "version": "1.1",
+    "description": "Executes Krax coding jobs via Grok interface.",
+    "permissions": [
+        "alarms",
+        "activeTab",
+        "scripting",
+        "clipboardRead"
+    ],
+    "host_permissions": [
+        "http://localhost:3001/*",
+        "https://grok.com/*",
+        "https://*.grok.com/*",
+        "https://x.com/i/grok*",
+        "https://*.x.com/i/grok*",
+        "https://x.ai/*",
+        "https://*.x.ai/*"
+    ],
+    "background": {
+        "service_worker": "background.js"
+    },
+    "content_scripts": [
+        {
+            "matches": [
+                "https://grok.com/*",
+                "https://*.grok.com/*",
+                "https://x.com/i/grok*",
+                "https://*.x.com/i/grok*",
+                "https://x.ai/*",
+                "https://*.x.ai/*"
+            ],
+            "js": [
+                "content.js"
+            ]
+        }
+    ]
+}

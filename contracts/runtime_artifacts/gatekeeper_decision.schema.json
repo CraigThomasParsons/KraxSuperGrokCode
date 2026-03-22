@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://krax/contracts/runtime_artifacts/gatekeeper_decision.schema.json",
+  "title": "GatekeeperDecision",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "job_id",
+    "approved",
+    "reason",
+    "checks",
+    "created_at"
+  ],
+  "properties": {
+    "job_id": { "type": "string", "minLength": 1 },
+    "approved": { "type": "boolean" },
+    "reason": { "type": "string", "minLength": 1 },
+    "checks": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "passed"],
+        "properties": {
+          "name": { "type": "string", "minLength": 1 },
+          "passed": { "type": "boolean" }
+        }
+      }
+    },
+    "created_at": { "type": "string", "format": "date-time" }
+  }
+}

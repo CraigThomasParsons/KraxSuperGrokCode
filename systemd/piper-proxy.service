@@ -1,0 +1,14 @@
+[Unit]
+Description=Piper Proxy Agent Service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/Code/Piper/bin/piper_proxy.py
+WorkingDirectory=%h/Code/Piper
+# Pass necessary environment variables for GUI interaction
+Environment=DISPLAY=:0
+Environment=WAYLAND_DISPLAY=wayland-0
+# Adjust if needed for specific user setups
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://krax/contracts/runtime_artifacts/plan_v2.schema.json",
+  "title": "PlanV2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "job_id",
+    "stage",
+    "changes_from_v1",
+    "execution_notes",
+    "risk_notes",
+    "created_at"
+  ],
+  "properties": {
+    "job_id": { "type": "string", "minLength": 1 },
+    "stage": { "const": "krax" },
+    "changes_from_v1": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "execution_notes": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 },
+      "minItems": 1
+    },
+    "risk_notes": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "created_at": { "type": "string", "format": "date-time" }
+  }
+}

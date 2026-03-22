@@ -1,0 +1,23 @@
+# Runtime directories (generated data, not source)
+runs/
+archive/
+failed/
+outbox/
+scratchpad/
+
+# Job queue (user-specific)
+inbox/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
