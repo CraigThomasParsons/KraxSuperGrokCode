@@ -1,10 +1,18 @@
 import os
+import json
 import requests
 from typing import Dict, Any, List, Optional
 
 
 # Path to config.yaml relative to this module (bin/lib/ -> project root).
 _CONFIG_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "config.yaml"))
+
+# Local registry of workspace IDs we've created. The Grok /rest/workspaces
+# list endpoint always returns empty, so we track our own workspace mappings
+# to prevent duplicate creation on subsequent sync runs.
+_WORKSPACE_REGISTRY_PATH = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "grok_sync", "workspace_registry.json")
+)
 
 
 def _load_config() -> dict:
@@ -110,8 +118,10 @@ class GrokApiClient:
                 # GrokApiClient instances don't need to hit Chrome's DB again.
                 self._save_cookie_to_config()
 
-        # Actual endpoint URLs may require manual updating by intercepting Network requests.
+        # Grok Code Projects are "workspaces" in the REST API.
+        # The base_url is used for conversations; workspaces have their own path.
         self.base_url = "https://grok.com/rest/app-chat"
+        self.workspaces_url = "https://grok.com/rest/workspaces"
 
         self.session = requests.Session()
         self._setup_headers()
@@ -196,68 +206,162 @@ class GrokApiClient:
 
         return False
 
-    def create_project(self, name: str, description: str = "") -> Dict[str, Any]:
+    def create_project(self, name: str, instructions: str = "") -> Dict[str, Any]:
         """
-        Submits physical creation parameters to Grok.
-        Returns the parsed JSON response including the project ID payload.
+        Create a new Grok Code Project (workspace) via the REST API.
+
+        Returns the parsed JSON response including the workspaceId. Also saves
+        the workspace ID to the local registry so find_project_by_name() can
+        locate it on subsequent runs (the Grok list endpoint always returns empty).
+
+        The 'instructions' parameter maps to Grok's 'customPersonality' field,
+        which is what the UI shows as "Instructions" in the project settings.
         """
         if not self.is_configured():
             raise ValueError("grok_session_cookie is unconfigured in config.yaml.")
-            
-        url = f"{self.base_url}/projects/create"
-        payload = {
-            "name": name,
-            "description": description
-        }
 
-        # NOTE: This endpoint may change depending on Grok's internal GraphQL or REST topology 
-        print(f"[GrokApiClient] Issuing project creation POST to {url}...")
+        # Grok Code Projects are "workspaces" in the REST API.
+        # The 'customPersonality' field is the Instructions text shown in the UI.
+        url = self.workspaces_url
+        payload = {"name": name}
+
+        # Attach the Instructions content if provided by the pipeline.
+        if instructions:
+            payload["customPersonality"] = instructions
+
+        print(f"[GrokApiClient] Creating workspace '{name}' via POST {url}...")
         res = self.session.post(url, json=payload, timeout=10)
-        
+
+        try:
+            res.raise_for_status()
+            workspace_data = res.json()
+
+            # Save the mapping to our local registry since the Grok list
+            # endpoint doesn't return user-created workspaces.
+            workspace_id = workspace_data.get("workspaceId", "")
+            if workspace_id:
+                self._save_to_registry(name, workspace_id)
+
+            return workspace_data
+        except requests.exceptions.HTTPError as http_error:
+            response_text = res.text
+            raise RuntimeError(
+                f"Grok API HTTP Error {res.status_code} during workspace creation: {response_text}"
+            ) from http_error
+
+    def get_project(self, workspace_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch a single workspace by its ID.
+
+        Returns the workspace dict if it exists, or None if the ID is invalid
+        or the workspace has been deleted. This is the primary way to verify
+        a workspace still exists since the list endpoint is unreliable.
+        """
+        if not self.is_configured():
+            raise ValueError("grok_session_cookie is unconfigured in config.yaml.")
+
+        url = f"{self.workspaces_url}/{workspace_id}"
+        print(f"[GrokApiClient] Fetching workspace {workspace_id}...")
+        res = self.session.get(url, timeout=10)
+
+        if res.status_code == 404:
+            return None
+
         try:
             res.raise_for_status()
             return res.json()
-        except requests.exceptions.HTTPError as e:
-            text = res.text
-            raise RuntimeError(f"Grok API HTTP Error {res.status_code} during project creation: {text}") from e
+        except requests.exceptions.HTTPError as http_error:
+            response_text = res.text
+            raise RuntimeError(
+                f"Grok API HTTP Error {res.status_code} fetching workspace: {response_text}"
+            ) from http_error
 
     def list_projects(self) -> List[Dict[str, Any]]:
         """
-        Retrieves existing projects to prevent blind duplicates.
-        """
-        if not self.is_configured():
-            raise ValueError("grok_session_cookie is unconfigured in config.yaml.")
-            
-        url = f"{self.base_url}/projects"
-        print(f"[GrokApiClient] Issuing project listing GET to {url}...")
-        res = self.session.get(url, timeout=10)
-        
-        try:
-            res.raise_for_status()
-            data = res.json()
-            # Depending on Grok's schema, it could be a raw array or nested inside 'data' or 'projects'
-            return data.get("projects", data) if isinstance(data, dict) else data
-        except requests.exceptions.HTTPError as e:
-            text = res.text
-            raise RuntimeError(f"Grok API HTTP Error {res.status_code} during project listing: {text}") from e
+        List known Grok workspaces from the local registry.
 
-    def delete_project(self, project_id: str) -> bool:
-        """
-        Physically deletes or halts the specified workspace context.
+        The Grok /rest/workspaces GET endpoint always returns empty for
+        user-created workspaces, so we maintain a local registry that maps
+        project names to workspace IDs. Each entry is verified by GET to
+        confirm the workspace still exists before being returned.
         """
         if not self.is_configured():
             raise ValueError("grok_session_cookie is unconfigured in config.yaml.")
-            
-        url = f"{self.base_url}/projects/{project_id}"
-        print(f"[GrokApiClient] Issuing project deletion DELETE to {url}...")
+
+        # Load the local registry of workspaces we've created.
+        registry = self._load_registry()
+        verified_workspaces = []
+
+        # Verify each registered workspace still exists on Grok's side.
+        for project_name, workspace_id in registry.items():
+            workspace_data = self.get_project(workspace_id)
+            if workspace_data is not None:
+                verified_workspaces.append(workspace_data)
+
+        return verified_workspaces
+
+    def delete_project(self, workspace_id: str) -> bool:
+        """
+        Delete a Grok workspace by its ID.
+
+        Also removes the entry from the local registry to keep it clean.
+        """
+        if not self.is_configured():
+            raise ValueError("grok_session_cookie is unconfigured in config.yaml.")
+
+        url = f"{self.workspaces_url}/{workspace_id}"
+        print(f"[GrokApiClient] Deleting workspace {workspace_id}...")
         res = self.session.delete(url, timeout=10)
-        
+
         try:
             res.raise_for_status()
+            # Remove from local registry.
+            self._remove_from_registry(workspace_id)
             return True
-        except requests.exceptions.HTTPError as e:
-            text = res.text
-            raise RuntimeError(f"Grok API HTTP Error {res.status_code} during project deletion: {text}") from e
+        except requests.exceptions.HTTPError as http_error:
+            response_text = res.text
+            raise RuntimeError(
+                f"Grok API HTTP Error {res.status_code} during workspace deletion: {response_text}"
+            ) from http_error
+
+    def update_instructions(self, workspace_id: str, instructions: str, name: str = "") -> Dict[str, Any]:
+        """
+        Update the Instructions (customPersonality) on an existing workspace.
+
+        Grok's PUT endpoint requires the workspace name to be included in every
+        update, so we fetch the current workspace data first to preserve the
+        existing name unless a new one is explicitly provided.
+
+        Returns the updated workspace dict from the API.
+        """
+        if not self.is_configured():
+            raise ValueError("grok_session_cookie is unconfigured in config.yaml.")
+
+        # Fetch current workspace data to preserve the name field.
+        # Grok's PUT replaces all editable fields, so we must include the name.
+        if not name:
+            current_data = self.get_project(workspace_id)
+            if current_data is None:
+                raise RuntimeError(f"Workspace {workspace_id} not found — cannot update instructions.")
+            name = current_data.get("name", "")
+
+        url = f"{self.workspaces_url}/{workspace_id}"
+        payload = {
+            "name": name,
+            "customPersonality": instructions,
+        }
+
+        print(f"[GrokApiClient] Updating instructions on workspace {workspace_id} ({len(instructions)} chars)...")
+        res = self.session.put(url, json=payload, timeout=15)
+
+        try:
+            res.raise_for_status()
+            return res.json()
+        except requests.exceptions.HTTPError as http_error:
+            response_text = res.text
+            raise RuntimeError(
+                f"Grok API HTTP Error {res.status_code} during instructions update: {response_text}"
+            ) from http_error
 
     def health_check(self) -> bool:
         """
@@ -288,22 +392,86 @@ class GrokApiClient:
 
     def find_project_by_name(self, project_name: str) -> Optional[Dict[str, Any]]:
         """
-        Search existing Grok projects for a case-insensitive name match.
+        Search for an existing Grok workspace by project name.
 
-        Returns the first project dict whose name matches, or None if no
-        match is found. Used by Stage 1 to prevent duplicate project creation
-        when re-running the pipeline against the same Bridgit package.
+        First checks the local registry (fast, no API call), then verifies
+        the workspace still exists on Grok's side via GET. Returns the
+        workspace dict if found, or None if no match exists.
+
+        Also handles the case where the user manually created a project in
+        the Grok UI and added it to the registry via config or prior sync.
         """
-        existing_projects = self.list_projects()
-
-        # Normalize the target name for comparison — Grok project names
-        # may have been created with different casing than what Bridgit uses.
+        # Check the local registry first — this is the primary lookup path
+        # since Grok's list endpoint doesn't return user-created workspaces.
+        registry = self._load_registry()
         normalized_target = project_name.strip().lower()
 
-        for project_entry in existing_projects:
-            # Grok's project response schema may use 'name' or 'title' — handle both.
-            entry_name = project_entry.get("name", "") or project_entry.get("title", "")
-            if entry_name.strip().lower() == normalized_target:
-                return project_entry
+        for registered_name, workspace_id in registry.items():
+            if registered_name.strip().lower() == normalized_target:
+                # Verify the workspace still exists on Grok's side.
+                workspace_data = self.get_project(workspace_id)
+                if workspace_data is not None:
+                    return workspace_data
+                else:
+                    # Workspace was deleted on Grok's side — remove stale entry.
+                    print(f"[GrokApiClient] Stale registry entry for '{registered_name}' — removing.")
+                    self._remove_from_registry(workspace_id)
 
         return None
+
+    # ─────────────────────────────────────────────────────
+    # Local workspace registry — tracks name→ID mappings
+    # ─────────────────────────────────────────────────────
+
+    def _load_registry(self) -> Dict[str, str]:
+        """
+        Load the workspace registry from grok_sync/workspace_registry.json.
+
+        Returns a dict mapping project names to workspace IDs. Returns empty
+        dict if the file doesn't exist or is corrupted.
+        """
+        if not os.path.isfile(_WORKSPACE_REGISTRY_PATH):
+            return {}
+
+        try:
+            with open(_WORKSPACE_REGISTRY_PATH, "r", encoding="utf-8") as registry_file:
+                data = json.load(registry_file)
+                return data if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def _save_registry(self, registry: Dict[str, str]) -> None:
+        """
+        Persist the workspace registry to grok_sync/workspace_registry.json.
+
+        Uses atomic write (write to .tmp then rename) to prevent corruption
+        if the process is interrupted mid-write.
+        """
+        # Ensure the parent directory exists.
+        registry_dir = os.path.dirname(_WORKSPACE_REGISTRY_PATH)
+        os.makedirs(registry_dir, exist_ok=True)
+
+        temp_path = _WORKSPACE_REGISTRY_PATH + ".tmp"
+        try:
+            with open(temp_path, "w", encoding="utf-8") as temp_file:
+                json.dump(registry, temp_file, indent=2)
+            os.replace(temp_path, _WORKSPACE_REGISTRY_PATH)
+        except (OSError, IOError) as write_error:
+            print(f"[GrokApiClient] Failed to save workspace registry: {write_error}")
+
+    def _save_to_registry(self, project_name: str, workspace_id: str) -> None:
+        """Add or update a project→workspace mapping in the local registry."""
+        registry = self._load_registry()
+        registry[project_name] = workspace_id
+        self._save_registry(registry)
+        print(f"[GrokApiClient] Registered workspace: {project_name} -> {workspace_id}")
+
+    def _remove_from_registry(self, workspace_id: str) -> None:
+        """Remove a workspace from the registry by its ID."""
+        registry = self._load_registry()
+        # Find and remove the entry with matching workspace ID.
+        updated_registry = {
+            name: wid for name, wid in registry.items() if wid != workspace_id
+        }
+        if len(updated_registry) < len(registry):
+            self._save_registry(updated_registry)

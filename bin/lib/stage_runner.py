@@ -76,35 +76,44 @@ def execute_stage_one(
 
     if existing_project is not None:
         # Project found — reuse it instead of creating a duplicate.
-        grok_project_id = existing_project.get("id", existing_project.get("projectId", ""))
+        grok_project_id = existing_project.get("workspaceId", "")
         action_taken = "found"
         print(f"[StageRunner] Found existing project: {grok_project_id}")
     else:
         # Step 3: Create the project since it doesn't exist yet.
+        # Build instructions early so we can include them at creation time.
         print(f"[StageRunner] No existing project found. Creating '{project_name}'...")
-        description_text = _extract_short_description(artifact_bundle)
-        creation_response = grok_client.create_project(project_name, description_text)
+        instructions_text = instructions_builder.build(artifact_bundle)
+        creation_response = grok_client.create_project(project_name, instructions_text)
 
-        # Extract the project ID from the creation response — Grok's schema may vary.
-        grok_project_id = creation_response.get("id", creation_response.get("projectId", ""))
+        # Grok's workspace API uses "workspaceId" as the identifier.
+        grok_project_id = creation_response.get("workspaceId", "")
         action_taken = "created"
         print(f"[StageRunner] Created project: {grok_project_id}")
 
-    # Step 4: Build and set Instructions from artifacts + base template.
-    instructions_text = instructions_builder.build(artifact_bundle)
+    # Step 4: Build Instructions from artifacts + base template.
+    # For new projects, instructions were already set at creation time,
+    # but we always update to ensure the latest artifact content is applied.
+    # For existing projects, this is the first time instructions are pushed.
+    if action_taken != "created":
+        instructions_text = instructions_builder.build(artifact_bundle)
     instructions_were_set = False
 
     if instructions_text.strip() and grok_project_id:
-        try:
-            # NOTE: set_instructions() is pending C1 API discovery.
-            # Once the endpoint is known, uncomment and implement in grok_api_client.py.
-            # grok_client.set_instructions(grok_project_id, instructions_text)
-            # instructions_were_set = True
-            print(f"[StageRunner] Instructions built ({len(instructions_text)} chars) — "
-                  "API endpoint pending C1 discovery, skipping set for now.")
-        except Exception as instructions_error:
-            # Non-fatal: log the error but don't fail the whole stage.
-            print(f"[StageRunner] WARNING: Failed to set Instructions: {instructions_error}")
+        if action_taken == "created":
+            # Instructions were already included in the creation payload,
+            # so we just record success without making an extra API call.
+            instructions_were_set = True
+            print(f"[StageRunner] Instructions set at creation ({len(instructions_text)} chars)")
+        else:
+            try:
+                # Push updated Instructions to an existing project.
+                grok_client.update_instructions(grok_project_id, instructions_text)
+                instructions_were_set = True
+                print(f"[StageRunner] Instructions updated ({len(instructions_text)} chars)")
+            except Exception as instructions_error:
+                # Non-fatal: log the error but don't fail the whole stage.
+                print(f"[StageRunner] WARNING: Failed to set Instructions: {instructions_error}")
 
     # Step 5: Write the result artifact to disk.
     result_payload = {
@@ -124,27 +133,5 @@ def execute_stage_one(
         print(f"[StageRunner] Wrote result to {result_path}")
 
     return result_payload
-
-
-def _extract_short_description(artifact_bundle) -> str:
-    """
-    Pull the first 1-2 sentences from VISION.md to use as the Grok project description.
-
-    Falls back to an empty string if VISION.md has no useful content.
-    """
-    vision_content = artifact_bundle.artifacts.get("VISION.md", "")
-    if not vision_content.strip():
-        return ""
-
-    # Grab the first non-heading, non-empty line as a description.
-    for line in vision_content.splitlines():
-        stripped_line = line.strip()
-        # Skip markdown headings and blank lines.
-        if not stripped_line or stripped_line.startswith("#"):
-            continue
-        # Cap at 200 chars to keep the Grok UI clean.
-        if len(stripped_line) > 200:
-            return stripped_line[:197] + "..."
-        return stripped_line
 
     return ""
