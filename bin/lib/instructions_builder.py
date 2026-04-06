@@ -86,6 +86,37 @@ def _load_base_template() -> Optional[str]:
         return None
 
 
+def _strip_leading_heading(content: str) -> str:
+    """
+    Remove the first markdown heading from artifact content.
+
+    Each artifact file (VISION.md, CONSTRAINTS.md, etc.) starts with its own
+    heading like '# Technical Constraints'. Since the instructions builder adds
+    its own section headings ('## Technical Constraints'), including the original
+    would produce a confusing duplicate. This strips the first heading line and
+    any immediately following blank lines.
+    """
+    lines = content.strip().splitlines()
+    cleaned_lines = []
+    heading_stripped = False
+
+    for line in lines:
+        # Strip only the very first heading — subsequent headings (subheadings
+        # within the artifact) are kept since they provide useful structure.
+        if not heading_stripped and line.strip().startswith("#"):
+            heading_stripped = True
+            continue
+
+        # Skip blank lines immediately after the stripped heading so there's
+        # no awkward extra whitespace at the top of the section.
+        if heading_stripped and not cleaned_lines and not line.strip():
+            continue
+
+        cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines).strip()
+
+
 def _build_vision_section(artifact_bundle) -> Optional[str]:
     """
     Extract project purpose from VISION.md and format as an Instructions section.
@@ -97,10 +128,11 @@ def _build_vision_section(artifact_bundle) -> Optional[str]:
         return None
 
     # Take the first N characters of the vision document.
-    trimmed_vision = vision_content.strip()[:VISION_CHAR_BUDGET]
+    stripped_vision = _strip_leading_heading(vision_content)
+    trimmed_vision = stripped_vision[:VISION_CHAR_BUDGET]
 
     # If we truncated mid-line, cut back to the last complete line.
-    if len(vision_content.strip()) > VISION_CHAR_BUDGET:
+    if len(stripped_vision) > VISION_CHAR_BUDGET:
         last_newline_position = trimmed_vision.rfind("\n")
         if last_newline_position > 0:
             trimmed_vision = trimmed_vision[:last_newline_position]
@@ -117,9 +149,10 @@ def _build_constraints_section(artifact_bundle) -> Optional[str]:
     if not constraints_content.strip():
         return None
 
-    trimmed_constraints = constraints_content.strip()[:CONSTRAINTS_CHAR_BUDGET]
+    stripped_constraints = _strip_leading_heading(constraints_content)
+    trimmed_constraints = stripped_constraints[:CONSTRAINTS_CHAR_BUDGET]
 
-    if len(constraints_content.strip()) > CONSTRAINTS_CHAR_BUDGET:
+    if len(stripped_constraints) > CONSTRAINTS_CHAR_BUDGET:
         last_newline_position = trimmed_constraints.rfind("\n")
         if last_newline_position > 0:
             trimmed_constraints = trimmed_constraints[:last_newline_position]
@@ -136,9 +169,10 @@ def _build_personas_section(artifact_bundle) -> Optional[str]:
     if not personas_content.strip():
         return None
 
-    trimmed_personas = personas_content.strip()[:PERSONAS_CHAR_BUDGET]
+    stripped_personas = _strip_leading_heading(personas_content)
+    trimmed_personas = stripped_personas[:PERSONAS_CHAR_BUDGET]
 
-    if len(personas_content.strip()) > PERSONAS_CHAR_BUDGET:
+    if len(stripped_personas) > PERSONAS_CHAR_BUDGET:
         last_newline_position = trimmed_personas.rfind("\n")
         if last_newline_position > 0:
             trimmed_personas = trimmed_personas[:last_newline_position]
