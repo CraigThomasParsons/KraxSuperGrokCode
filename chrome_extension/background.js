@@ -1,5 +1,6 @@
 // background.js for Krax Automation
-// Defines the background service worker that polls the local Krax Server.
+// Defines the background service worker that polls the local Krax Server
+// and automatically refreshes Grok session cookies.
 
 // The local Krax server will be running on port 3001 to avoid Auralis conflicts
 const SERVER_URL = "http://localhost:3001";
@@ -7,6 +8,134 @@ let processingJobId = null;
 let activeTabId = null;
 const POLL_ALARM = "kraxPoll";
 const POLL_MINUTES = 0.1; // 6 seconds
+
+// Cookie refresh runs on a separate alarm — every 1 minute it extracts
+// the sso/sso-rw cookies from grok.com and POSTs them to the Krax server
+// so the API client always has fresh credentials without manual intervention.
+const COOKIE_REFRESH_ALARM = "grokCookieRefresh";
+const COOKIE_REFRESH_MINUTES = 1;
+
+// ─────────────────────────────────────────────────────
+// Cookie Extraction — keeps config.yaml fresh overnight
+// ─────────────────────────────────────────────────────
+
+async function extractGrokCookies() {
+    try {
+        // Search across all domains Grok might set auth cookies on.
+        // The sso and sso-rw cookies are set by x.com's auth system
+        // since Grok shares the X/Twitter SSO infrastructure.
+        const cookieDomains = ["grok.com", ".grok.com", "x.com", ".x.com", "x.ai", ".x.ai"];
+        let allCookies = [];
+
+        // Domain-based lookup captures cookies regardless of path.
+        for (const domain of cookieDomains) {
+            const cookies = await chrome.cookies.getAll({ domain });
+            if (cookies.length > 0) {
+                allCookies = allCookies.concat(cookies);
+            }
+        }
+
+        // URL-based lookup as a fallback — sometimes domain-based misses
+        // cookies that were set with a specific path attribute.
+        const cookieUrls = ["https://grok.com/", "https://x.com/", "https://x.ai/"];
+        for (const url of cookieUrls) {
+            const cookies = await chrome.cookies.getAll({ url });
+            if (cookies.length > 0) {
+                allCookies = allCookies.concat(cookies);
+            }
+        }
+
+        // Deduplicate by name+domain to avoid counting the same cookie twice
+        // from overlapping domain/URL results.
+        const seenCookieKeys = new Set();
+        allCookies = allCookies.filter(cookieEntry => {
+            const deduplicationKey = `${cookieEntry.name}@${cookieEntry.domain}`;
+            if (seenCookieKeys.has(deduplicationKey)) return false;
+            seenCookieKeys.add(deduplicationKey);
+            return true;
+        });
+
+        if (allCookies.length === 0) {
+            console.warn("[Krax Cookie] No cookies found on Grok/X domains. Are you logged in?");
+            return;
+        }
+
+        // Extract the specific SSO cookies that the Grok API requires.
+        // These are set by x.com's auth infrastructure and shared with grok.com.
+        const ssoCookie = allCookies.find(cookieEntry => cookieEntry.name === "sso");
+        const ssoRwCookie = allCookies.find(cookieEntry => cookieEntry.name === "sso-rw");
+
+        // Build the raw Cookie header string in the format grok_api_client expects.
+        // The API client sends this as-is in the Cookie: header of every request.
+        const cookieParts = [];
+        if (ssoCookie && ssoCookie.value) {
+            cookieParts.push(`sso=${ssoCookie.value}`);
+        }
+        if (ssoRwCookie && ssoRwCookie.value) {
+            cookieParts.push(`sso-rw=${ssoRwCookie.value}`);
+        }
+
+        if (cookieParts.length === 0) {
+            // No SSO cookies found — try a broader search for any auth-looking
+            // cookies in case Grok changes their cookie naming convention.
+            const authCookie = allCookies.find(cookieEntry =>
+                cookieEntry.name.includes("sso") ||
+                cookieEntry.name.includes("session") ||
+                cookieEntry.name.includes("auth")
+            );
+            if (authCookie) {
+                console.log(`[Krax Cookie] Fallback: found "${authCookie.name}" on ${authCookie.domain}`);
+                cookieParts.push(`${authCookie.name}=${authCookie.value}`);
+            } else {
+                console.warn("[Krax Cookie] No SSO or auth cookies found among", allCookies.length, "cookies");
+                console.warn("[Krax Cookie] Available cookies:", allCookies.map(c => `${c.name}@${c.domain}`));
+                return;
+            }
+        }
+
+        const cookieString = cookieParts.join("; ");
+
+        // Look for a device ID cookie — Grok sometimes uses this for rate limiting.
+        const deviceCookie = allCookies.find(cookieEntry =>
+            cookieEntry.name.includes("device") || cookieEntry.name === "x-device-id"
+        );
+        const deviceIdValue = deviceCookie ? deviceCookie.value : "";
+
+        // POST the extracted cookie to the Krax server's config update endpoint.
+        // The server writes this to config.yaml so the GrokApiClient picks it up.
+        const response = await fetch(`${SERVER_URL}/api/cookie/update`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                cookie_string: cookieString,
+                device_id: deviceIdValue
+            })
+        });
+
+        if (!response.ok) {
+            console.error(`[Krax Cookie] Server returned ${response.status} ${response.statusText}`);
+            return;
+        }
+
+        const responseData = await response.json();
+        console.log(`[Krax Cookie] Updated successfully (${cookieString.length} chars):`, responseData.message || "OK");
+
+        // Record the last successful refresh for debugging in chrome://extensions.
+        chrome.storage.local.set({
+            lastCookieUpdate: new Date().toISOString(),
+            lastCookieLength: cookieString.length
+        });
+
+    } catch (extractionError) {
+        // Don't let cookie extraction failures interfere with job polling —
+        // the two systems are independent and should fail independently.
+        console.error("[Krax Cookie] Extraction error:", extractionError);
+    }
+}
+
+// ─────────────────────────────────────────────────────
+// Job Polling — existing Auralis/Grok automation logic
+// ─────────────────────────────────────────────────────
 
 async function pollForJob() {
     // If we are currently holding a lock for a job, skip polling
@@ -33,28 +162,40 @@ async function pollForJob() {
 }
 
 // MV3 service workers can sleep, so use alarms instead of setInterval polling.
+// Two alarms: one for job polling (6s), one for cookie refresh (1min).
 chrome.runtime.onInstalled.addListener(() => {
     chrome.alarms.create(POLL_ALARM, { periodInMinutes: POLL_MINUTES });
+    chrome.alarms.create(COOKIE_REFRESH_ALARM, { periodInMinutes: COOKIE_REFRESH_MINUTES });
 });
 
 chrome.runtime.onStartup.addListener(() => {
     chrome.alarms.create(POLL_ALARM, { periodInMinutes: POLL_MINUTES });
+    chrome.alarms.create(COOKIE_REFRESH_ALARM, { periodInMinutes: COOKIE_REFRESH_MINUTES });
 });
 
+// Ensure both alarms exist even if the service worker restarts mid-session.
 chrome.alarms.get(POLL_ALARM, (existing) => {
     if (!existing) {
         chrome.alarms.create(POLL_ALARM, { periodInMinutes: POLL_MINUTES });
+    }
+});
+chrome.alarms.get(COOKIE_REFRESH_ALARM, (existing) => {
+    if (!existing) {
+        chrome.alarms.create(COOKIE_REFRESH_ALARM, { periodInMinutes: COOKIE_REFRESH_MINUTES });
     }
 });
 
 chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === POLL_ALARM) {
         pollForJob();
+    } else if (alarm.name === COOKIE_REFRESH_ALARM) {
+        extractGrokCookies();
     }
 });
 
-// Kick one immediate poll when the worker wakes.
+// Kick one immediate poll + cookie extraction when the worker wakes.
 pollForJob();
+extractGrokCookies();
 
 // Spawns or focuses a Grok tab to execute the given job
 async function processJob(job) {

@@ -55,6 +55,56 @@ def load_config(config_path: str) -> dict:
     return config
 
 
+def update_config_yaml(cookie_string: str, device_id: str = "") -> None:
+    """
+    Write fresh Grok session credentials to config.yaml.
+
+    Preserves existing comments and non-cookie config lines. Only overwrites
+    the grok_session_cookie and grok_device_id values. Called by the
+    /api/cookie/update endpoint when the Chrome Extension pushes new cookies.
+    """
+    config_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "config.yaml"))
+
+    # Read the existing config file to preserve comments and other settings.
+    existing_lines = []
+    if os.path.exists(config_path):
+        with open(config_path, "r", encoding="utf-8") as config_file:
+            existing_lines = config_file.readlines()
+
+    # Track which keys we've updated so we can append missing ones at the end.
+    updated_cookie = False
+    updated_device = False
+    output_lines = []
+
+    for line in existing_lines:
+        stripped_line = line.strip()
+
+        # Replace the grok_session_cookie line with the fresh value.
+        if stripped_line.startswith("grok_session_cookie:"):
+            output_lines.append(f"grok_session_cookie: {cookie_string}\n")
+            updated_cookie = True
+        # Replace the grok_device_id line if a new device ID was provided.
+        elif stripped_line.startswith("grok_device_id:") and device_id:
+            output_lines.append(f"grok_device_id: {device_id}\n")
+            updated_device = True
+        else:
+            # Preserve all other lines (comments, blank lines, other config).
+            output_lines.append(line)
+
+    # If the config file didn't have these keys, append them.
+    if not updated_cookie:
+        output_lines.append(f"grok_session_cookie: {cookie_string}\n")
+    if not updated_device and device_id:
+        output_lines.append(f"grok_device_id: {device_id}\n")
+
+    # Write atomically by writing to a temp file first, then renaming.
+    # This prevents partial writes from corrupting config.yaml mid-update.
+    temp_path = config_path + ".tmp"
+    with open(temp_path, "w", encoding="utf-8") as temp_file:
+        temp_file.writelines(output_lines)
+    os.replace(temp_path, config_path)
+
+
 def resolve_auralis_inbox_path(config: dict) -> str:
     configured = (config.get("auralis_inbox_path") or "").strip()
     if configured:
@@ -761,7 +811,53 @@ class KraxHandler(http.server.BaseHTTPRequestHandler):
 
             self._set_headers(200)
             self.wfile.write(json.dumps({"status": "failed", "moved": bool(moved)}).encode())
-            
+
+        elif self.path == '/api/cookie/update':
+            # Receives fresh Grok session cookies from the Chrome Extension's
+            # automatic cookie extraction alarm. This keeps config.yaml current
+            # so the GrokApiClient always has valid credentials without manual
+            # intervention or browser DevTools cookie copying.
+            length = int(self.headers.get('content-length', 0))
+
+            try:
+                data = json.loads(self.rfile.read(length))
+            except json.JSONDecodeError:
+                self._set_headers(400)
+                self.wfile.write(json.dumps({"error": "invalid_json"}).encode())
+                return
+
+            cookie_string = data.get("cookie_string", "").strip()
+            device_id_value = data.get("device_id", "").strip()
+
+            if not cookie_string:
+                self._set_headers(400)
+                self.wfile.write(json.dumps({"error": "missing_cookie_string"}).encode())
+                return
+
+            try:
+                # Persist the cookie to config.yaml so it survives server restarts.
+                update_config_yaml(cookie_string, device_id_value)
+
+                # Hot-reload the in-memory GrokApiClient so the next API call
+                # uses the fresh cookie without requiring a server restart.
+                grok_client = GrokApiClient()
+                grok_client.reload_config()
+
+                # Log the update with length, not the actual cookie value —
+                # cookies are secrets and should not appear in log files.
+                print(f"[Cookie API] Updated grok_session_cookie ({len(cookie_string)} chars)")
+
+                self._set_headers(200)
+                self.wfile.write(json.dumps({
+                    "message": "Cookie updated",
+                    "cookie_length": len(cookie_string),
+                }).encode())
+
+            except Exception as config_write_error:
+                print(f"[Cookie API] Error updating config: {config_write_error}")
+                self._set_headers(500)
+                self.wfile.write(json.dumps({"error": str(config_write_error)}).encode())
+
         else:
             self._set_headers(404)
 
