@@ -27,6 +27,10 @@ from lib.regression_smoke import write_vera_smoke_verdict
 from lib.runtime_artifact_validator import has_stage_role_violations, write_gatekeeper_decision
 from contracts.auralis_to_krax import validate_krax_job
 from lib import post_office
+from lib.grok_api_client import GrokApiClient
+from lib.inbox_classifier import classify_package, AURALIS_JOB, BRIDGIT_PACKAGE
+from lib.artifact_reader import read_artifacts_from_directory
+from lib.stage_runner import execute_stage_one
 
 # Krax runs on port 3001 to avoid colliding with Auralis on 3000
 PORT = 3001
@@ -225,11 +229,87 @@ def build_prompt(job: dict) -> str:
     return "\n".join(lines)
 
 
+def handle_bridgit_package(inbox_entry_name: str):
+    """
+    Process a Bridgit artifact package deposited by the ChatProjectsToKraxBridge.
+
+    Reads the artifact bundle, runs Stage 1 (ensure Grok project exists + set
+    Instructions), and archives the package on success or moves to failed/ on error.
+    Stage 2 (source upload) is skipped until C1 API discovery is complete.
+    """
+    inbox_path = os.path.join(fs.INBOX_DIR, inbox_entry_name)
+    print(f"[Bridgit] Processing package: {inbox_entry_name}")
+
+    try:
+        # Read artifacts from the inbox package directory.
+        artifact_bundle = read_artifacts_from_directory(inbox_path)
+
+        if not artifact_bundle.is_valid():
+            print(f"[Bridgit] Invalid package (missing VISION.md): {inbox_entry_name}")
+            fs.reject_job(inbox_entry_name, ["bridgit_package_invalid: missing VISION.md"])
+            return
+
+        # Determine project name from letter.toml metadata or VISION.md heading.
+        project_name = artifact_bundle.get_project_name()
+        if not project_name:
+            print(f"[Bridgit] Cannot determine project name for: {inbox_entry_name}")
+            fs.reject_job(inbox_entry_name, ["bridgit_package_invalid: no project name"])
+            return
+
+        # Stage 1: Ensure Grok project exists and set Instructions.
+        grok_client = GrokApiClient()
+        stage_one_result = execute_stage_one(
+            grok_client=grok_client,
+            artifact_bundle=artifact_bundle,
+            project_name=project_name,
+        )
+
+        print(f"[Bridgit] Stage 1 complete: {stage_one_result.get('action_taken')} "
+              f"project '{project_name}' (id: {stage_one_result.get('grok_project_id')})")
+
+        # Write sync result into the package before archiving.
+        sync_result = {
+            "package": inbox_entry_name,
+            "project_name": project_name,
+            "stage_1": stage_one_result,
+            "stage_2": "pending_api_discovery",
+            "completed_at": fs.utc_now_iso(),
+        }
+        fs.write_json_atomic(os.path.join(inbox_path, "sync_result.json"), sync_result)
+
+        # Archive the successfully processed package.
+        fs.archive_job(inbox_entry_name)
+        print(f"[Bridgit] Archived package: {inbox_entry_name}")
+
+    except RuntimeError as api_error:
+        # RuntimeError from stage_runner means Grok API is unreachable.
+        print(f"[Bridgit] API error for {inbox_entry_name}: {api_error}")
+        fs.write_json_atomic(
+            os.path.join(inbox_path, "sync_failure.json"),
+            {"error": str(api_error), "failed_at": fs.utc_now_iso()},
+        )
+        fs.fail_job(inbox_entry_name)
+
+    except Exception as unexpected_error:
+        print(f"[Bridgit] Unexpected error for {inbox_entry_name}: {unexpected_error}")
+        fs.fail_job(inbox_entry_name)
+
+
 def poll_inbox():
     while True:
         jobs = fs.find_jobs()
 
         for inbox_job_dir in jobs:
+            # Classify the package before processing — Bridgit packages
+            # take a different path than Auralis jobs.
+            inbox_full_path = os.path.join(fs.INBOX_DIR, inbox_job_dir)
+            package_type = classify_package(inbox_full_path)
+
+            if package_type == BRIDGIT_PACKAGE:
+                handle_bridgit_package(inbox_job_dir)
+                continue
+
+            # Below this point: existing Auralis job handling (unchanged).
             try:
                 job = fs.read_job_files(inbox_job_dir)
                 reasons = validate_krax_job(job)
@@ -250,6 +330,33 @@ def poll_inbox():
                     detail="Promoted inbox job to runs and wrote receipt.",
                 )
                 print(f"[TYS] Job {canonical_job_id} received from Auralis")
+
+                # Native Tool Interception (Executes physically without Chrome Extension)
+                if job.get("action") == "create_project":
+                    print(f"[*] Krax native tool execution: create_project for '{job.get('goal')}'")
+                    try:
+                        client = GrokApiClient()
+                        project_data = client.create_project(
+                            name=job.get("goal", "Automated Project"),
+                            description=job.get("context", "")
+                        )
+                        # Complete natively and bypass the browser extension queue
+                        fs.write_text_atomic(os.path.join(run_dir, "grok.txt"), json.dumps(project_data))
+                        fs.write_text_atomic(os.path.join(run_dir, "response.txt"), f"Project created natively.\n\nProject ID: {project_data.get('id', 'unknown')}")
+                        fs.update_receipt_status(run_dir, "grok_complete")
+                        fs.append_run_trace_event(
+                            run_dir,
+                            job_id=canonical_job_id,
+                            stage="krax",
+                            event="native_tool_executed",
+                            detail="create_project tool successfully executed via internal API driver.",
+                        )
+                        fs.archive_job(canonical_job_id)
+                        continue
+                    except Exception as e:
+                        print(f"[!] Error executing native create_project tool: {e}")
+                        fs.fail_job(canonical_job_id)
+                        continue
 
             except Exception as exc:
                 try:
